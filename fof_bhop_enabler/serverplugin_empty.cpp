@@ -87,9 +87,7 @@ bool PatchBunnyhopCheck()
 	{
 		if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
 			section->VirtualAddress >= moduleSize)
-		{
 			continue;
-		}
 
 		size_t sectionSize = static_cast<size_t>(section->Misc.VirtualSize);
 		const size_t remainingSize = moduleSize - section->VirtualAddress;
