@@ -141,16 +141,15 @@ EXPOSE_SINGLE_INTERFACE_GLOBALVAR(CEmptyServerPlugin, IServerPluginCallbacks, IN
 #elif defined(_LINUX)
 extern "C" __attribute__((visibility("default"))) void *CreateInterface(const char *pName, int *pReturnCode)
 {
-	if (pName && std::strcmp(pName, INTERFACEVERSION_ISERVERPLUGINCALLBACKS) == 0) {
-		if (pReturnCode) {
+	if (pName && std::strcmp(pName, INTERFACEVERSION_ISERVERPLUGINCALLBACKS) == 0)
+	{
+		if (pReturnCode)
 			*pReturnCode = IFACE_OK;
-		}
 		return static_cast<IServerPluginCallbacks *>(&g_EmtpyServerPlugin);
 	}
 
-	if (pReturnCode) {
+	if (pReturnCode)
 		*pReturnCode = IFACE_FAILED;
-	}
 	return nullptr;
 }
 #endif
@@ -171,23 +170,20 @@ static bool WriteVtableEntry(uintptr_t *entry, uintptr_t value)
 {
 #if defined(_WIN32)
 	DWORD oldProtect = 0;
-	if (!VirtualProtect(entry, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+	if (!VirtualProtect(entry, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect))
 		return false;
-	}
 
 	*entry = value;
 	VirtualProtect(entry, sizeof(uintptr_t), oldProtect, &oldProtect);
 	return true;
 #elif defined(_LINUX)
 	const long pageSize = sysconf(_SC_PAGESIZE);
-	if (pageSize <= 0) {
+	if (pageSize <= 0)
 		return false;
-	}
 
 	const uintptr_t page = reinterpret_cast<uintptr_t>(entry) & ~(static_cast<uintptr_t>(pageSize) - 1);
-	if (mprotect(reinterpret_cast<void *>(page), static_cast<size_t>(pageSize), PROT_READ | PROT_WRITE) != 0) {
+	if (mprotect(reinterpret_cast<void *>(page), static_cast<size_t>(pageSize), PROT_READ | PROT_WRITE) != 0)
 		return false;
-	}
 
 	*entry = value;
 	__builtin___clear_cache(reinterpret_cast<char *>(page), reinterpret_cast<char *>(page + pageSize));
@@ -198,16 +194,14 @@ static bool WriteVtableEntry(uintptr_t *entry, uintptr_t value)
 
 void *HookMethod(void *pObj, void *pHookMethod, size_t index)
 {
-	if (!pObj || !pHookMethod) {
+	if (!pObj || !pHookMethod)
 		return nullptr;
-	}
 
 	uintptr_t *vtable = *(uintptr_t **)pObj;
 	uintptr_t *entry = &vtable[index];
 	uintptr_t original = *entry;
-	if (!WriteVtableEntry(entry, reinterpret_cast<uintptr_t>(pHookMethod))) {
+	if (!WriteVtableEntry(entry, reinterpret_cast<uintptr_t>(pHookMethod)))
 		return nullptr;
-	}
 
 	return reinterpret_cast<void *>(original);
 }
@@ -259,14 +253,14 @@ bool CEmptyServerPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfac
 	(void)interfaceFactory;
 
 	g_pGameMovement = gameServerFactory("GameMovement001", nullptr);
-	if (!g_pGameMovement) {
+	if (!g_pGameMovement)
 		return false;
-	}
 
 	pfnAiraccelerate = decltype(pfnAiraccelerate)(HookMethod(g_pGameMovement, reinterpret_cast<void *>(myAiraccelerate), kAirAccelerateIndex));
 	pfnAccelerate = decltype(pfnAccelerate)(HookMethod(g_pGameMovement, reinterpret_cast<void *>(myAccelerate), kAccelerateIndex));
 
-	if (!pfnAiraccelerate || !pfnAccelerate) {
+	if (!pfnAiraccelerate || !pfnAccelerate)
+	{
 		Unload();
 		return false;
 	}
@@ -279,12 +273,14 @@ bool CEmptyServerPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfac
 //---------------------------------------------------------------------------------
 void CEmptyServerPlugin::Unload(void)
 {
-	if (g_pGameMovement && pfnAccelerate) {
+	if (g_pGameMovement && pfnAccelerate)
+	{
 		HookMethod(g_pGameMovement, reinterpret_cast<void *>(pfnAccelerate), kAccelerateIndex);
 		pfnAccelerate = nullptr;
 	}
 
-	if (g_pGameMovement && pfnAiraccelerate) {
+	if (g_pGameMovement && pfnAiraccelerate)
+	{
 		HookMethod(g_pGameMovement, reinterpret_cast<void *>(pfnAiraccelerate), kAirAccelerateIndex);
 		pfnAiraccelerate = nullptr;
 	}
