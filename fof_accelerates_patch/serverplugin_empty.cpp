@@ -1,420 +1,348 @@
-
 //========= Copyright Valve Corporation, All rights reserved. ============//
-//
-// Purpose: 
-//
-// $NoKeywords: $
-//
-//===========================================================================//
+// Replaces FoF's movement acceleration arguments on the 32-bit server.
+
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
-#if defined(_WIN32)
+#ifdef _WIN32
 #include <Windows.h>
-#include <Psapi.h>
 #include "eiface.h"
-#include "igameevents.h"
-
-// memdbgon must be the last include file in a .cpp file!!!
-#include "tier0/memdbgon.h"
-#elif defined(_LINUX)
-#include <cstdio>
+#else
+#include <dlfcn.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
-struct Vector
-{
-	float x;
-	float y;
-	float z;
-};
-
+// Keep the Linux plugin buildable without an SDK checkout. This is the
+// published IServerPluginCallbacks003 ABI; callback order must stay intact.
+struct Vector { float x, y, z; };
 struct edict_t;
 class CCommand;
-class KeyValues;
-
-using CreateInterfaceFn = void *(*)(const char *pName, int *pReturnCode);
+using CreateInterfaceFn = void *(*)(const char *, int *);
 using QueryCvarCookie_t = int;
-
-enum
-{
-	IFACE_OK = 0,
-	IFACE_FAILED
-};
-
-enum PLUGIN_RESULT
-{
-	PLUGIN_CONTINUE = 0,
-	PLUGIN_OVERRIDE,
-	PLUGIN_STOP,
-};
-
+enum { IFACE_OK = 0, IFACE_FAILED };
+enum PLUGIN_RESULT { PLUGIN_CONTINUE = 0, PLUGIN_OVERRIDE, PLUGIN_STOP };
 enum EQueryCvarValueStatus
 {
 	eQueryCvarValueStatus_ValueIntact = 0,
-	eQueryCvarValueStatus_CvarNotFound = 1,
-	eQueryCvarValueStatus_NotACvar = 2,
-	eQueryCvarValueStatus_CvarProtected = 3,
+	eQueryCvarValueStatus_CvarNotFound,
+	eQueryCvarValueStatus_NotACvar,
+	eQueryCvarValueStatus_CvarProtected
 };
-
 #define INTERFACEVERSION_ISERVERPLUGINCALLBACKS "ISERVERPLUGINCALLBACKS003"
-
-class IGameEventListener
-{
-public:
-	virtual void FireGameEvent(KeyValues *event) = 0;
-};
-
 class IServerPluginCallbacks
 {
 public:
-	virtual bool Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerFactory) = 0;
-	virtual void Unload(void) = 0;
-	virtual void Pause(void) = 0;
-	virtual void UnPause(void) = 0;
-	virtual const char *GetPluginDescription(void) = 0;
-	virtual void LevelInit(char const *pMapName) = 0;
-	virtual void ServerActivate(edict_t *pEdictList, int edictCount, int clientMax) = 0;
-	virtual void GameFrame(bool simulating) = 0;
-	virtual void LevelShutdown(void) = 0;
-	virtual void ClientActive(edict_t *pEntity) = 0;
-	virtual void ClientDisconnect(edict_t *pEntity) = 0;
-	virtual void ClientPutInServer(edict_t *pEntity, char const *playername) = 0;
-	virtual void SetCommandClient(int index) = 0;
-	virtual void ClientSettingsChanged(edict_t *pEdict) = 0;
-	virtual PLUGIN_RESULT ClientConnect(bool *bAllowConnect, edict_t *pEntity, const char *pszName, const char *pszAddress, char *reject, int maxrejectlen) = 0;
-	virtual PLUGIN_RESULT ClientCommand(edict_t *pEntity, const CCommand &args) = 0;
-	virtual PLUGIN_RESULT NetworkIDValidated(const char *pszUserName, const char *pszNetworkID) = 0;
-	virtual void OnQueryCvarValueFinished(QueryCvarCookie_t iCookie, edict_t *pPlayerEntity, EQueryCvarValueStatus eStatus, const char *pCvarName, const char *pCvarValue) = 0;
-	virtual void OnEdictAllocated(edict_t *edict) = 0;
-	virtual void OnEdictFreed(const edict_t *edict) = 0;
+	virtual bool Load(CreateInterfaceFn, CreateInterfaceFn) = 0;
+	virtual void Unload() = 0;
+	virtual void Pause() = 0;
+	virtual void UnPause() = 0;
+	virtual const char *GetPluginDescription() = 0;
+	virtual void LevelInit(const char *) = 0;
+	virtual void ServerActivate(edict_t *, int, int) = 0;
+	virtual void GameFrame(bool) = 0;
+	virtual void LevelShutdown() = 0;
+	virtual void ClientActive(edict_t *) = 0;
+	virtual void ClientDisconnect(edict_t *) = 0;
+	virtual void ClientPutInServer(edict_t *, const char *) = 0;
+	virtual void SetCommandClient(int) = 0;
+	virtual void ClientSettingsChanged(edict_t *) = 0;
+	virtual PLUGIN_RESULT ClientConnect(bool *, edict_t *, const char *, const char *, char *, int) = 0;
+	virtual PLUGIN_RESULT ClientCommand(edict_t *, const CCommand &) = 0;
+	virtual PLUGIN_RESULT NetworkIDValidated(const char *, const char *) = 0;
+	virtual void OnQueryCvarValueFinished(QueryCvarCookie_t, edict_t *, EQueryCvarValueStatus, const char *, const char *) = 0;
+	virtual void OnEdictAllocated(edict_t *) = 0;
+	virtual void OnEdictFreed(const edict_t *) = 0;
 };
 #endif
 
-//---------------------------------------------------------------------------------
-// Purpose: a sample 3rd party plugin class
-//---------------------------------------------------------------------------------
-class CEmptyServerPlugin : public IServerPluginCallbacks, public IGameEventListener
+#ifdef _WIN32
+// memdbgon must be the last include file in a .cpp file!!!
+#include "tier0/memdbgon.h"
+#endif
+
+static_assert(sizeof(void *) == 4, "FoF movement vtable indices require a 32-bit build.");
+
+namespace
+{
+#ifdef _WIN32
+const size_t kAirAccelerateIndex = 20;
+const size_t kAccelerateIndex = 24;
+// __fastcall receives the original thiscall ECX and reserves EDX.
+using AccelerateFn = void (__fastcall *)(void *, void *, Vector &, float, float);
+#else
+// GCC adds one destructor entry before the movement methods.
+const size_t kAirAccelerateIndex = 21;
+const size_t kAccelerateIndex = 25;
+using AccelerateFn = void (*)(void *, Vector &, float, float);
+#endif
+const float kAirAcceleration = 100.0f;
+const float kGroundAcceleration = 10.0f;
+
+uintptr_t *g_vtable = nullptr;
+AccelerateFn g_airAccelerate = nullptr;
+AccelerateFn g_accelerate = nullptr;
+bool g_paused = true;
+#ifdef _WIN32
+HMODULE g_moduleKeepalive = nullptr;
+#else
+void *g_moduleKeepalive = nullptr;
+#endif
+
+#ifndef _WIN32
+bool GetProtection(const void *address, int &protection)
+{
+	FILE *maps = std::fopen("/proc/self/maps", "r");
+	if (!maps)
+		return false;
+	char line[512];
+	bool found = false;
+	const uintptr_t value = reinterpret_cast<uintptr_t>(address);
+	while (std::fgets(line, sizeof(line), maps))
+	{
+		unsigned long long start, end;
+		char flags[5];
+		if (std::sscanf(line, "%llx-%llx %4s", &start, &end, flags) == 3 &&
+			value >= start && value < end)
+		{
+			protection = (flags[0] == 'r' ? PROT_READ : 0) |
+				(flags[1] == 'w' ? PROT_WRITE : 0) | (flags[2] == 'x' ? PROT_EXEC : 0);
+			found = flags[0] == 'r';
+			break;
+		}
+	}
+	std::fclose(maps);
+	return found;
+}
+#endif
+
+bool WriteVtableEntry(uintptr_t *entry, uintptr_t value)
+{
+	// An aligned pointer cannot straddle a protection-page boundary.
+	if (!entry || reinterpret_cast<uintptr_t>(entry) % sizeof(*entry) != 0)
+		return false;
+	const uintptr_t previous = *entry;
+	if (previous == value)
+		return true;
+#ifdef _WIN32
+	MEMORY_BASIC_INFORMATION region;
+	if (!VirtualQuery(entry, &region, sizeof(region)) ||
+		region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+		return false;
+	const DWORD writable = (region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+		PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+	DWORD protection;
+	if (!VirtualProtect(entry, sizeof(*entry), writable, &protection))
+		return false;
+	*entry = value;
+	DWORD ignored;
+	if (VirtualProtect(entry, sizeof(*entry), protection, &ignored))
+		return true;
+	*entry = previous;
+	if (!VirtualProtect(entry, sizeof(*entry), protection, &ignored))
+		std::fprintf(stderr, "[FoF accelerates] Could not restore vtable-page protection.\n");
+#else
+	const long pageSize = sysconf(_SC_PAGESIZE);
+	int protection;
+	if (pageSize <= 0 || !GetProtection(entry, protection))
+		return false;
+	const uintptr_t address = reinterpret_cast<uintptr_t>(entry);
+	void *page = reinterpret_cast<void *>(address - address % pageSize);
+	if (mprotect(page, static_cast<size_t>(pageSize), protection | PROT_WRITE) != 0)
+		return false;
+	*entry = value;
+	if (mprotect(page, static_cast<size_t>(pageSize), protection) == 0)
+		return true;
+	*entry = previous;
+	if (mprotect(page, static_cast<size_t>(pageSize), protection) != 0)
+		std::fprintf(stderr, "[FoF accelerates] Could not restore vtable-page protection.\n");
+#endif
+	// The pointer was rolled back while the page was still writable.
+	return false;
+}
+
+#ifdef _WIN32
+void __fastcall AirAccelerate(void *self, void *edx, Vector &direction, float speed, float acceleration)
+{
+	g_airAccelerate(self, edx, direction, speed, g_paused ? acceleration : kAirAcceleration);
+}
+void __fastcall Accelerate(void *self, void *edx, Vector &direction, float speed, float acceleration)
+{
+	g_accelerate(self, edx, direction, speed, g_paused ? acceleration : kGroundAcceleration);
+}
+#else
+void AirAccelerate(void *self, Vector &direction, float speed, float acceleration)
+{
+	g_airAccelerate(self, direction, speed, g_paused ? acceleration : kAirAcceleration);
+}
+void Accelerate(void *self, Vector &direction, float speed, float acceleration)
+{
+	g_accelerate(self, direction, speed, g_paused ? acceleration : kGroundAcceleration);
+}
+#endif
+
+// Unload has no failure return in the engine ABI. If another plugin chains
+// our callback, keep this module resident so that callback remains callable.
+bool RetainModule()
+{
+	if (g_moduleKeepalive)
+		return true;
+#ifdef _WIN32
+	return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		reinterpret_cast<LPCSTR>(AirAccelerate), &g_moduleKeepalive) != FALSE;
+#else
+	Dl_info info;
+	if (!dladdr(reinterpret_cast<void *>(AirAccelerate), &info) || !info.dli_fname)
+		return false;
+	g_moduleKeepalive = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+	return g_moduleKeepalive != nullptr;
+#endif
+}
+
+void ReleaseModule()
+{
+	if (!g_moduleKeepalive)
+		return;
+#ifdef _WIN32
+	FreeLibrary(g_moduleKeepalive);
+#else
+	dlclose(g_moduleKeepalive);
+#endif
+	g_moduleKeepalive = nullptr;
+}
+
+bool SetHook(size_t index, AccelerateFn hook, AccelerateFn original, bool enabled)
+{
+	uintptr_t *entry = g_vtable + index;
+	const uintptr_t expected = reinterpret_cast<uintptr_t>(enabled ? original : hook);
+	const uintptr_t desired = reinterpret_cast<uintptr_t>(enabled ? hook : original);
+	if (*entry == desired)
+		return true;
+	if (*entry != expected)
+	{
+		std::fprintf(stderr, "[FoF accelerates] Movement slot %zu changed by another hook.\n", index);
+		return false;
+	}
+	return WriteVtableEntry(entry, desired);
+}
+
+bool RestoreHooks()
+{
+	if (!g_vtable)
+		return true;
+	// Attempt both slots even when one restoration fails.
+	const bool ground = SetHook(kAccelerateIndex, Accelerate, g_accelerate, false);
+	const bool air = SetHook(kAirAccelerateIndex, AirAccelerate, g_airAccelerate, false);
+	return ground && air;
+}
+
+bool InstallHooks()
+{
+	g_paused = true;
+	if (SetHook(kAirAccelerateIndex, AirAccelerate, g_airAccelerate, true) &&
+		SetHook(kAccelerateIndex, Accelerate, g_accelerate, true))
+	{
+		g_paused = false;
+		return true;
+	}
+	std::fprintf(stderr, "[FoF accelerates] Could not install both movement hooks.\n");
+	return false;
+}
+}
+
+class CFoFAcceleratesPlugin : public IServerPluginCallbacks
 {
 public:
-	CEmptyServerPlugin();
-	~CEmptyServerPlugin();
-
-	// IServerPluginCallbacks methods
-	virtual bool			Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerFactory);
-	virtual void			Unload(void);
-	virtual void			Pause(void);
-	virtual void			UnPause(void);
-	virtual const char *GetPluginDescription(void);
-	virtual void			LevelInit(char const *pMapName);
-	virtual void			ServerActivate(edict_t *pEdictList, int edictCount, int clientMax);
-	virtual void			GameFrame(bool simulating);
-	virtual void			LevelShutdown(void);
-	virtual void			ClientActive(edict_t *pEntity);
-	virtual void			ClientDisconnect(edict_t *pEntity);
-	virtual void			ClientPutInServer(edict_t *pEntity, char const *playername);
-	virtual void			SetCommandClient(int index);
-	virtual void			ClientSettingsChanged(edict_t *pEdict);
-	virtual PLUGIN_RESULT	ClientConnect(bool *bAllowConnect, edict_t *pEntity, const char *pszName, const char *pszAddress, char *reject, int maxrejectlen);
-	virtual PLUGIN_RESULT	ClientCommand(edict_t *pEntity, const CCommand &args);
-	virtual PLUGIN_RESULT	NetworkIDValidated(const char *pszUserName, const char *pszNetworkID);
-	virtual void			OnQueryCvarValueFinished(QueryCvarCookie_t iCookie, edict_t *pPlayerEntity, EQueryCvarValueStatus eStatus, const char *pCvarName, const char *pCvarValue);
-	virtual void			OnEdictAllocated(edict_t *edict);
-	virtual void			OnEdictFreed(const edict_t *edict);
-
-	// IGameEventListener Interface
-	virtual void FireGameEvent(KeyValues *event);
-
-	virtual int GetCommandIndex() { return m_iClientCommandIndex; }
-private:
-	int m_iClientCommandIndex;
-};
-
-// 
-// The plugin is a static singleton that is exported as an interface
-//
-CEmptyServerPlugin g_EmtpyServerPlugin;
-#if defined(_WIN32)
-EXPOSE_SINGLE_INTERFACE_GLOBALVAR(CEmptyServerPlugin, IServerPluginCallbacks, INTERFACEVERSION_ISERVERPLUGINCALLBACKS, g_EmtpyServerPlugin);
-#elif defined(_LINUX)
-extern "C" __attribute__((visibility("default"))) void *CreateInterface(const char *pName, int *pReturnCode)
-{
-	if (pName && std::strcmp(pName, INTERFACEVERSION_ISERVERPLUGINCALLBACKS) == 0)
+	bool Load(CreateInterfaceFn, CreateInterfaceFn factory) override
 	{
-		if (pReturnCode)
-			*pReturnCode = IFACE_OK;
-		return static_cast<IServerPluginCallbacks *>(&g_EmtpyServerPlugin);
+		if (g_vtable)
+			return true; // Do not save our own hooks as the original methods.
+		if (!factory)
+			return false;
+		void *movement = factory("GameMovement001", nullptr);
+		if (!movement)
+			return false;
+		uintptr_t *table = *static_cast<uintptr_t **>(movement);
+		if (!table || !table[kAirAccelerateIndex] || !table[kAccelerateIndex])
+			return false;
+		if (table[kAirAccelerateIndex] == reinterpret_cast<uintptr_t>(AirAccelerate) ||
+			table[kAccelerateIndex] == reinterpret_cast<uintptr_t>(Accelerate))
+			return false;
+
+		g_vtable = table;
+		// Save both originals before exposing either callback to the engine.
+		g_airAccelerate = reinterpret_cast<AccelerateFn>(table[kAirAccelerateIndex]);
+		g_accelerate = reinterpret_cast<AccelerateFn>(table[kAccelerateIndex]);
+		if (InstallHooks())
+			return true;
+		if (RestoreHooks())
+		{
+			g_vtable = nullptr;
+			g_airAccelerate = nullptr;
+			g_accelerate = nullptr;
+			return false;
+		}
+		// Load failure would unload this DLL with a live callback still in it.
+		std::fprintf(stderr, "[FoF accelerates] Rollback failed; staying loaded in pass-through mode.\n");
+		return true;
 	}
 
-	if (pReturnCode)
-		*pReturnCode = IFACE_FAILED;
+	void Unload() override
+	{
+		g_paused = true;
+		if (!RestoreHooks())
+		{
+			if (RetainModule())
+				std::fprintf(stderr, "[FoF accelerates] Unhook failed; retaining module in pass-through mode.\n");
+			else
+				std::fprintf(stderr, "[FoF accelerates] Unhook and module retention failed; server restart required.\n");
+			return;
+		}
+		g_vtable = nullptr;
+		g_airAccelerate = nullptr;
+		g_accelerate = nullptr;
+		ReleaseModule();
+	}
+	void Pause() override { g_paused = true; }
+	void UnPause() override { if (g_vtable) InstallHooks(); }
+	const char *GetPluginDescription() override { return "[FoF] Airaccelerates Patch"; }
+	void LevelInit(const char *) override {}
+	void ServerActivate(edict_t *, int, int) override {}
+	void GameFrame(bool) override {}
+	void LevelShutdown() override {}
+	void ClientActive(edict_t *) override {}
+	void ClientDisconnect(edict_t *) override {}
+	void ClientPutInServer(edict_t *, const char *) override {}
+	void SetCommandClient(int) override {}
+	void ClientSettingsChanged(edict_t *) override {}
+	PLUGIN_RESULT ClientConnect(bool *, edict_t *, const char *, const char *, char *, int) override { return PLUGIN_CONTINUE; }
+	PLUGIN_RESULT ClientCommand(edict_t *, const CCommand &) override { return PLUGIN_CONTINUE; }
+	PLUGIN_RESULT NetworkIDValidated(const char *, const char *) override { return PLUGIN_CONTINUE; }
+	void OnQueryCvarValueFinished(QueryCvarCookie_t, edict_t *, EQueryCvarValueStatus, const char *, const char *) override {}
+	void OnEdictAllocated(edict_t *) override {}
+	void OnEdictFreed(const edict_t *) override {}
+};
+
+CFoFAcceleratesPlugin g_FoFAcceleratesPlugin;
+#ifdef _WIN32
+EXPOSE_SINGLE_INTERFACE_GLOBALVAR(CFoFAcceleratesPlugin, IServerPluginCallbacks,
+	INTERFACEVERSION_ISERVERPLUGINCALLBACKS, g_FoFAcceleratesPlugin);
+#else
+extern "C" __attribute__((visibility("default"))) void *CreateInterface(const char *name, int *result)
+{
+	if (name && std::strcmp(name, INTERFACEVERSION_ISERVERPLUGINCALLBACKS) == 0)
+	{
+		if (result)
+			*result = IFACE_OK;
+		return static_cast<IServerPluginCallbacks *>(&g_FoFAcceleratesPlugin);
+	}
+	if (result)
+		*result = IFACE_FAILED;
 	return nullptr;
 }
 #endif
-
-//---------------------------------------------------------------------------------
-// Purpose: constructor/destructor
-//---------------------------------------------------------------------------------
-CEmptyServerPlugin::CEmptyServerPlugin()
-{
-	m_iClientCommandIndex = 0;
-}
-
-CEmptyServerPlugin::~CEmptyServerPlugin()
-{
-}
-
-static bool WriteVtableEntry(uintptr_t *entry, uintptr_t value)
-{
-#if defined(_WIN32)
-	DWORD oldProtect = 0;
-	if (!VirtualProtect(entry, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect))
-		return false;
-
-	*entry = value;
-	VirtualProtect(entry, sizeof(uintptr_t), oldProtect, &oldProtect);
-	return true;
-#elif defined(_LINUX)
-	const long pageSize = sysconf(_SC_PAGESIZE);
-	if (pageSize <= 0)
-		return false;
-
-	const uintptr_t page = reinterpret_cast<uintptr_t>(entry) & ~(static_cast<uintptr_t>(pageSize) - 1);
-	if (mprotect(reinterpret_cast<void *>(page), static_cast<size_t>(pageSize), PROT_READ | PROT_WRITE) != 0)
-		return false;
-
-	*entry = value;
-	__builtin___clear_cache(reinterpret_cast<char *>(page), reinterpret_cast<char *>(page + pageSize));
-	mprotect(reinterpret_cast<void *>(page), static_cast<size_t>(pageSize), PROT_READ);
-	return true;
-#endif
-}
-
-void *HookMethod(void *pObj, void *pHookMethod, size_t index)
-{
-	if (!pObj || !pHookMethod)
-		return nullptr;
-
-	uintptr_t *vtable = *(uintptr_t **)pObj;
-	uintptr_t *entry = &vtable[index];
-	uintptr_t original = *entry;
-	if (!WriteVtableEntry(entry, reinterpret_cast<uintptr_t>(pHookMethod)))
-		return nullptr;
-
-	return reinterpret_cast<void *>(original);
-}
-
-// .rdata:105BBF6C                 dd offset sub_1019D1E0
-#if defined(_WIN32)
-void(__fastcall *pfnAiraccelerate)(void *pthis, int dummy, Vector &wishdir, float wishspeed, float accel);
-void __fastcall myAiraccelerate(void *pthis, int dummy, Vector &wishdir, float wishspeed, float accel)
-{
-	pfnAiraccelerate(pthis, dummy, wishdir, wishspeed, 100.0f);
-}
-
-// .rdata:105BBF7C                 dd offset sub_1019D020
-int(__fastcall *pfnAccelerate)(void *pthis, int dummy, Vector &wishdir, float wishspeed, float accel);
-int __fastcall myAccelerate(void *pthis, int dummy, Vector &wishdir, float wishspeed, float accel)
-{
-	return pfnAccelerate(pthis, dummy, wishdir, wishspeed, 10.0f);
-}
-#elif defined(_LINUX)
-void(*pfnAiraccelerate)(void *pthis, Vector &wishdir, float wishspeed, float accel);
-void myAiraccelerate(void *pthis, Vector &wishdir, float wishspeed, float accel)
-{
-	pfnAiraccelerate(pthis, wishdir, wishspeed, 100.0f);
-}
-
-// Linux/GCC vtables have one extra destructor slot compared with the Windows build.
-int(*pfnAccelerate)(void *pthis, Vector &wishdir, float wishspeed, float accel);
-int myAccelerate(void *pthis, Vector &wishdir, float wishspeed, float accel)
-{
-	return pfnAccelerate(pthis, wishdir, wishspeed, 10.0f);
-}
-#endif
-
-void *g_pGameMovement;
-
-#if defined(_WIN32)
-static constexpr size_t kAirAccelerateIndex = 20;
-static constexpr size_t kAccelerateIndex = 24;
-#elif defined(_LINUX)
-static constexpr size_t kAirAccelerateIndex = 21;
-static constexpr size_t kAccelerateIndex = 25;
-#endif
-
-//---------------------------------------------------------------------------------
-// Purpose: called when the plugin is loaded, load the interface we need from the engine
-//---------------------------------------------------------------------------------
-bool CEmptyServerPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerFactory)
-{
-	(void)interfaceFactory;
-
-	g_pGameMovement = gameServerFactory("GameMovement001", nullptr);
-	if (!g_pGameMovement)
-		return false;
-
-	pfnAiraccelerate = decltype(pfnAiraccelerate)(HookMethod(g_pGameMovement, reinterpret_cast<void *>(myAiraccelerate), kAirAccelerateIndex));
-	pfnAccelerate = decltype(pfnAccelerate)(HookMethod(g_pGameMovement, reinterpret_cast<void *>(myAccelerate), kAccelerateIndex));
-
-	if (!pfnAiraccelerate || !pfnAccelerate)
-	{
-		Unload();
-		return false;
-	}
-
-	return true;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when the plugin is unloaded (turned off)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::Unload(void)
-{
-	if (g_pGameMovement && pfnAccelerate)
-	{
-		HookMethod(g_pGameMovement, reinterpret_cast<void *>(pfnAccelerate), kAccelerateIndex);
-		pfnAccelerate = nullptr;
-	}
-
-	if (g_pGameMovement && pfnAiraccelerate)
-	{
-		HookMethod(g_pGameMovement, reinterpret_cast<void *>(pfnAiraccelerate), kAirAccelerateIndex);
-		pfnAiraccelerate = nullptr;
-	}
-
-	g_pGameMovement = nullptr;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when the plugin is paused (i.e should stop running but isn't unloaded)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::Pause(void)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when the plugin is unpaused (i.e should start executing again)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::UnPause(void)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: the name of this plugin, returned in "plugin_print" command
-//---------------------------------------------------------------------------------
-const char *CEmptyServerPlugin::GetPluginDescription(void)
-{
-	return "[FoF] Airaccelerates Patch";
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on level start
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::LevelInit(char const *pMapName)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on level start, when the server is ready to accept client connections
-//		edictCount is the number of entities in the level, clientMax is the max client count
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::ServerActivate(edict_t *pEdictList, int edictCount, int clientMax)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called once per server frame, do recurring work here (like checking for timeouts)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::GameFrame(bool simulating)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on level end (as the server is shutting down or going to a new map)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::LevelShutdown(void) // !!!!this can get called multiple times per map change
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a client spawns into a server (i.e as they begin to play)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::ClientActive(edict_t *pEntity)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a client leaves a server (or is timed out)
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::ClientDisconnect(edict_t *pEntity)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on 
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::ClientPutInServer(edict_t *pEntity, char const *playername)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on level start
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::SetCommandClient(int index)
-{
-	m_iClientCommandIndex = index;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called on level start
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::ClientSettingsChanged(edict_t *pEdict)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a client joins a server
-//---------------------------------------------------------------------------------
-PLUGIN_RESULT CEmptyServerPlugin::ClientConnect(bool *bAllowConnect, edict_t *pEntity, const char *pszName, const char *pszAddress, char *reject, int maxrejectlen)
-{
-	return PLUGIN_CONTINUE;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a client types in a command (only a subset of commands however, not CON_COMMAND's)
-//---------------------------------------------------------------------------------
-PLUGIN_RESULT CEmptyServerPlugin::ClientCommand(edict_t *pEntity, const CCommand &args)
-{
-	return PLUGIN_CONTINUE;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a client is authenticated
-//---------------------------------------------------------------------------------
-PLUGIN_RESULT CEmptyServerPlugin::NetworkIDValidated(const char *pszUserName, const char *pszNetworkID)
-{
-	return PLUGIN_CONTINUE;
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when a cvar value query is finished
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::OnQueryCvarValueFinished(QueryCvarCookie_t iCookie, edict_t *pPlayerEntity, EQueryCvarValueStatus eStatus, const char *pCvarName, const char *pCvarValue)
-{
-}
-void CEmptyServerPlugin::OnEdictAllocated(edict_t *edict)
-{
-}
-void CEmptyServerPlugin::OnEdictFreed(const edict_t *edict)
-{
-}
-
-//---------------------------------------------------------------------------------
-// Purpose: called when an event is fired
-//---------------------------------------------------------------------------------
-void CEmptyServerPlugin::FireGameEvent(KeyValues *event)
-{
-}
